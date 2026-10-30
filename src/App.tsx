@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { usePeerConnection, PeerInfo } from './hooks/usePeerConnection';
 import { useRadioAudio } from './hooks/useRadioAudio';
+import { ErrorBoundary } from './components/ErrorBoundary';
 
 type Screen = 'lobby' | 'radio';
 
@@ -26,6 +27,9 @@ export default function App() {
   const [isOn, setIsOn] = useState(false);
   const [connecting, setConnecting] = useState(false);
   const [connectionError, setConnectionError] = useState('');
+  const [showDebug, setShowDebug] = useState(false);
+  const [micAllowed, setMicAllowed] = useState<boolean | null>(null);
+  const [testMode, setTestMode] = useState(false);
   const messageEndRef = useRef<HTMLDivElement>(null);
   const currentStreamRef = useRef<MediaStream | null>(null);
 
@@ -99,7 +103,7 @@ export default function App() {
         isIncoming: false,
       }]);
     } catch (err: any) {
-      setConnectionError(err.message || 'Failed to create room');
+      setConnectionError(err.message || 'Failed to create room. Check your internet connection.');
     }
     setConnecting(false);
   };
@@ -136,7 +140,8 @@ export default function App() {
   };
 
   const handlePushToTalk = useCallback(async () => {
-    if (!isOn || isReceiving || !peer.isConnected) return;
+    if (!isOn || isReceiving) return;
+    if (!testMode && peer.status !== 'waiting-for-peers') return;
     
     try {
       setIsTransmitting(true);
@@ -144,29 +149,33 @@ export default function App() {
       // Start transmission - get processed mic stream
       const processedStream = await audio.startTransmission();
       currentStreamRef.current = processedStream;
+      setMicAllowed(true);
       
-      // Send to all peers
-      peer.sendAudioStream(processedStream);
+      // Send to all peers (only if not in test mode)
+      if (!testMode) {
+        peer.sendAudioStream(processedStream);
+      }
 
       setMessages(prev => [...prev, {
         id: Date.now(),
         callsign: myCallsign.toUpperCase(),
-        text: '🎙️ Transmitting...',
+        text: testMode ? '🎙️ Transmitting (TEST MODE)...' : '🎙️ Transmitting...',
         timestamp: new Date(),
         isIncoming: false,
       }]);
     } catch (err) {
       console.error('PTT Error:', err);
       setIsTransmitting(false);
+      setMicAllowed(false);
       setMessages(prev => [...prev, {
         id: Date.now(),
         callsign: 'SYSTEM',
-        text: '⚠️ Microphone access denied. Allow mic permissions.',
+        text: '⚠️ Microphone access DENIED. Go to Settings → Chrome → Permissions → Microphone → Allow',
         timestamp: new Date(),
         isIncoming: false,
       }]);
     }
-  }, [isOn, isReceiving, peer, audio, myCallsign]);
+  }, [isOn, isReceiving, peer, audio, myCallsign, testMode]);
 
   const handleReleasePTT = useCallback(() => {
     if (!isTransmitting) return;
@@ -264,6 +273,36 @@ export default function App() {
             </button>
           </div>
 
+          {/* Test Mode */}
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+            <label className="text-[10px] text-gray-500 tracking-widest block mb-3">TEST MODE (NO CONNECTION)</label>
+            <button
+              onClick={() => {
+                if (!myCallsign.trim()) {
+                  setConnectionError('Enter your callsign first');
+                  return;
+                }
+                setTestMode(true);
+                setRoomCode('TEST');
+                setScreen('radio');
+                setIsOn(true);
+                audio.initAudio();
+                setMessages([{
+                  id: Date.now(),
+                  callsign: 'SYSTEM',
+                  text: '🧪 TEST MODE: Radio UI working. Hold PTT to test mic. No actual connection.',
+                  timestamp: new Date(),
+                  isIncoming: false,
+                }]);
+              }}
+              disabled={!myCallsign.trim()}
+              className="w-full py-3 bg-blue-900/30 border border-blue-800/50 rounded-lg text-blue-400 font-bold tracking-wider text-sm hover:bg-blue-900/50 active:scale-95 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              🧪 TEST LOCALLY
+            </button>
+            <p className="text-[9px] text-gray-600 mt-2 text-center">Test the radio without connecting to anyone</p>
+          </div>
+
           {/* Error */}
           {connectionError && (
             <div className="bg-red-950/30 border border-red-900/50 rounded-xl p-3 text-center">
@@ -278,6 +317,39 @@ export default function App() {
               No server required • Works over internet<br />
               One talks, all listen • Push-to-Talk
             </p>
+          </div>
+
+          {/* Mic Test */}
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 mb-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-[10px] text-gray-500 tracking-widest">MICROPHONE</p>
+                <p className="text-[10px] mt-1" style={{ color: micAllowed === null ? '#9ca3af' : micAllowed ? '#22c55e' : '#ef4444' }}>
+                  {micAllowed === null ? 'Not tested' : micAllowed ? '✓ Working' : '✗ Blocked'}
+                </p>
+              </div>
+              <button
+                onClick={async () => {
+                  try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    stream.getTracks().forEach(t => t.stop());
+                    setMicAllowed(true);
+                  } catch (e) {
+                    setMicAllowed(false);
+                  }
+                }}
+                className="px-3 py-2 bg-gray-800 rounded-lg text-[10px] text-gray-300 tracking-wider hover:bg-gray-700 active:scale-95 transition-all"
+              >
+                🎤 TEST
+              </button>
+            </div>
+            {micAllowed === false && (
+              <div className="mt-2 p-2 bg-red-950/30 border border-red-900/30 rounded">
+                <p className="text-[9px] text-red-400">
+                  <strong>Fix:</strong> Go to Settings → Apps → Chrome → Permissions → Microphone → Allow
+                </p>
+              </div>
+            )}
           </div>
 
           {/* How to use */}
@@ -295,6 +367,18 @@ export default function App() {
               <p className="text-[9px] text-gray-600 text-center">
                 ⚠️ Allow microphone access when prompted
               </p>
+            </div>
+          </div>
+
+          {/* Troubleshooting */}
+          <div className="bg-gray-900/50 border border-gray-800/50 rounded-xl p-4 mt-4">
+            <p className="text-[10px] text-gray-400 tracking-widest mb-2 text-center font-bold">TROUBLESHOOTING</p>
+            <div className="space-y-1.5 text-[9px] text-gray-500">
+              <p>• <strong className="text-gray-400">"Room not found"</strong> → Make sure host is online & code is exact</p>
+              <p>• <strong className="text-gray-400">Can't hear others</strong> → Check volume, phone not on silent</p>
+              <p>• <strong className="text-gray-400">Others can't hear me</strong> → Allow mic, hold PTT button</p>
+              <p>• <strong className="text-gray-400">Connection fails</strong> → Try WiFi instead of mobile data</p>
+              <p>• <strong className="text-gray-400">Use Chrome browser</strong> → Other browsers may not work</p>
             </div>
           </div>
         </div>
@@ -362,17 +446,58 @@ export default function App() {
           </div>
         </div>
 
+        {/* Test Mode Banner */}
+        {testMode && (
+          <div className="px-4 py-2 bg-blue-950/30 border-b border-blue-900/30 flex items-center justify-between">
+            <span className="text-[10px] text-blue-400 tracking-wider font-bold">🧪 TEST MODE</span>
+            <button
+              onClick={() => {
+                const callsigns = ['Alpha-1', 'Bravo-2', 'Charlie-3', 'Delta-4'];
+                const messages = [
+                  'All units, status report. Over.',
+                  'Roger that. All clear in sector 7.',
+                  'We have movement at grid 4-7.',
+                  'Copy. Moving to rally point.',
+                ];
+                const randomCallsign = callsigns[Math.floor(Math.random() * callsigns.length)];
+                const randomMsg = messages[Math.floor(Math.random() * messages.length)];
+                
+                setIsReceiving(true);
+                setReceivingFrom(randomCallsign);
+                audio.playIncomingAudio(new MediaStream());
+                
+                setMessages(prev => [...prev, {
+                  id: Date.now(),
+                  callsign: randomCallsign,
+                  text: `📡 "${randomMsg}"`,
+                  timestamp: new Date(),
+                  isIncoming: true,
+                }]);
+                
+                setTimeout(() => {
+                  setIsReceiving(false);
+                  setReceivingFrom('');
+                  audio.stopIncomingAudio();
+                }, 2000);
+              }}
+              className="px-2 py-1 bg-blue-900/50 rounded text-[9px] text-blue-400 tracking-wider hover:bg-blue-900/70 active:scale-95"
+            >
+              SIMULATE INCOMING
+            </button>
+          </div>
+        )}
+
         {/* Connected Units */}
         <div className="px-4 py-2 border-b border-gray-800/30">
           <div className="flex items-center justify-between">
             <span className="text-[9px] text-gray-500 tracking-widest">CONNECTED UNITS</span>
-            <span className="text-[9px] text-green-400">{peer.peers.length + 1} ONLINE</span>
+            <span className="text-[9px] text-green-400">{testMode ? 1 : peer.peers.length + 1} ONLINE</span>
           </div>
           <div className="flex flex-wrap gap-1 mt-1">
             <span className="px-2 py-0.5 bg-green-950/50 border border-green-900/30 rounded text-[9px] text-green-400 tracking-wider">
               {myCallsign.toUpperCase()} (YOU)
             </span>
-            {peer.peers.map(p => (
+            {!testMode && peer.peers.map(p => (
               <span key={p.peerId} className="px-2 py-0.5 bg-blue-950/30 border border-blue-900/30 rounded text-[9px] text-blue-400 tracking-wider">
                 {p.callsign || 'UNIT'}
               </span>
@@ -455,7 +580,7 @@ export default function App() {
             onMouseLeave={handleReleasePTT}
             onTouchStart={(e) => { e.preventDefault(); handlePushToTalk(); }}
             onTouchEnd={(e) => { e.preventDefault(); handleReleasePTT(); }}
-            disabled={isReceiving || !peer.isConnected}
+            disabled={isReceiving || (!testMode && peer.status !== 'waiting-for-peers')}
             className={`w-full py-5 rounded-xl font-bold text-lg tracking-wider transition-all duration-150 ${
               isTransmitting
                 ? 'bg-red-600 text-white shadow-[0_0_30px_rgba(239,68,68,0.5)] scale-95 border-2 border-red-400'
@@ -487,6 +612,38 @@ export default function App() {
             HOLD TO TALK • RELEASE TO LISTEN • ONE TALKS ALL LISTEN
           </p>
         </div>
+
+        {/* Debug toggle */}
+        <div className="px-4 py-1 bg-black/50 flex items-center justify-between">
+          <button
+            onClick={() => setShowDebug(!showDebug)}
+            className="text-[9px] text-gray-600 tracking-wider hover:text-gray-400"
+          >
+            {showDebug ? '▼ HIDE DEBUG' : '▶ SHOW DEBUG'}
+          </button>
+          <span className="text-[9px] text-gray-600">
+            Status: <span className={
+              peer.status === 'waiting-for-peers' ? 'text-green-400' :
+              peer.status === 'connecting' ? 'text-yellow-400' :
+              peer.status === 'error' ? 'text-red-400' : 'text-gray-500'
+            }>{peer.status.toUpperCase()}</span>
+          </span>
+        </div>
+
+        {/* Debug panel */}
+        {showDebug && (
+          <div className="bg-black px-3 py-2 max-h-32 overflow-y-auto border-t border-gray-800">
+            <div className="text-[8px] text-gray-500 font-mono space-y-0.5">
+              {peer.debugLog.length === 0 ? (
+                <p>No debug logs yet</p>
+              ) : (
+                peer.debugLog.map((log, i) => (
+                  <p key={i} className="break-all">{log}</p>
+                ))
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Bottom bar */}
         <div className="bg-black px-4 py-2 flex items-center justify-center">
