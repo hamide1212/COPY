@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { usePeerConnection, PeerInfo } from './hooks/usePeerConnection';
 import { useRadioAudio } from './hooks/useRadioAudio';
+import { ErrorBoundary } from './components/ErrorBoundary';
 
 type Screen = 'lobby' | 'radio';
 
@@ -28,6 +29,7 @@ export default function App() {
   const [connectionError, setConnectionError] = useState('');
   const [showDebug, setShowDebug] = useState(false);
   const [micAllowed, setMicAllowed] = useState<boolean | null>(null);
+  const [testMode, setTestMode] = useState(false);
   const messageEndRef = useRef<HTMLDivElement>(null);
   const currentStreamRef = useRef<MediaStream | null>(null);
 
@@ -138,7 +140,8 @@ export default function App() {
   };
 
   const handlePushToTalk = useCallback(async () => {
-    if (!isOn || isReceiving || peer.status !== 'waiting-for-peers') return;
+    if (!isOn || isReceiving) return;
+    if (!testMode && peer.status !== 'waiting-for-peers') return;
     
     try {
       setIsTransmitting(true);
@@ -148,13 +151,15 @@ export default function App() {
       currentStreamRef.current = processedStream;
       setMicAllowed(true);
       
-      // Send to all peers
-      peer.sendAudioStream(processedStream);
+      // Send to all peers (only if not in test mode)
+      if (!testMode) {
+        peer.sendAudioStream(processedStream);
+      }
 
       setMessages(prev => [...prev, {
         id: Date.now(),
         callsign: myCallsign.toUpperCase(),
-        text: '🎙️ Transmitting...',
+        text: testMode ? '🎙️ Transmitting (TEST MODE)...' : '🎙️ Transmitting...',
         timestamp: new Date(),
         isIncoming: false,
       }]);
@@ -170,7 +175,7 @@ export default function App() {
         isIncoming: false,
       }]);
     }
-  }, [isOn, isReceiving, peer, audio, myCallsign]);
+  }, [isOn, isReceiving, peer, audio, myCallsign, testMode]);
 
   const handleReleasePTT = useCallback(() => {
     if (!isTransmitting) return;
@@ -266,6 +271,36 @@ export default function App() {
             >
               {connecting ? 'CONNECTING...' : '🔗 JOIN ROOM'}
             </button>
+          </div>
+
+          {/* Test Mode */}
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-4">
+            <label className="text-[10px] text-gray-500 tracking-widest block mb-3">TEST MODE (NO CONNECTION)</label>
+            <button
+              onClick={() => {
+                if (!myCallsign.trim()) {
+                  setConnectionError('Enter your callsign first');
+                  return;
+                }
+                setTestMode(true);
+                setRoomCode('TEST');
+                setScreen('radio');
+                setIsOn(true);
+                audio.initAudio();
+                setMessages([{
+                  id: Date.now(),
+                  callsign: 'SYSTEM',
+                  text: '🧪 TEST MODE: Radio UI working. Hold PTT to test mic. No actual connection.',
+                  timestamp: new Date(),
+                  isIncoming: false,
+                }]);
+              }}
+              disabled={!myCallsign.trim()}
+              className="w-full py-3 bg-blue-900/30 border border-blue-800/50 rounded-lg text-blue-400 font-bold tracking-wider text-sm hover:bg-blue-900/50 active:scale-95 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              🧪 TEST LOCALLY
+            </button>
+            <p className="text-[9px] text-gray-600 mt-2 text-center">Test the radio without connecting to anyone</p>
           </div>
 
           {/* Error */}
@@ -411,17 +446,58 @@ export default function App() {
           </div>
         </div>
 
+        {/* Test Mode Banner */}
+        {testMode && (
+          <div className="px-4 py-2 bg-blue-950/30 border-b border-blue-900/30 flex items-center justify-between">
+            <span className="text-[10px] text-blue-400 tracking-wider font-bold">🧪 TEST MODE</span>
+            <button
+              onClick={() => {
+                const callsigns = ['Alpha-1', 'Bravo-2', 'Charlie-3', 'Delta-4'];
+                const messages = [
+                  'All units, status report. Over.',
+                  'Roger that. All clear in sector 7.',
+                  'We have movement at grid 4-7.',
+                  'Copy. Moving to rally point.',
+                ];
+                const randomCallsign = callsigns[Math.floor(Math.random() * callsigns.length)];
+                const randomMsg = messages[Math.floor(Math.random() * messages.length)];
+                
+                setIsReceiving(true);
+                setReceivingFrom(randomCallsign);
+                audio.playIncomingAudio(new MediaStream());
+                
+                setMessages(prev => [...prev, {
+                  id: Date.now(),
+                  callsign: randomCallsign,
+                  text: `📡 "${randomMsg}"`,
+                  timestamp: new Date(),
+                  isIncoming: true,
+                }]);
+                
+                setTimeout(() => {
+                  setIsReceiving(false);
+                  setReceivingFrom('');
+                  audio.stopIncomingAudio();
+                }, 2000);
+              }}
+              className="px-2 py-1 bg-blue-900/50 rounded text-[9px] text-blue-400 tracking-wider hover:bg-blue-900/70 active:scale-95"
+            >
+              SIMULATE INCOMING
+            </button>
+          </div>
+        )}
+
         {/* Connected Units */}
         <div className="px-4 py-2 border-b border-gray-800/30">
           <div className="flex items-center justify-between">
             <span className="text-[9px] text-gray-500 tracking-widest">CONNECTED UNITS</span>
-            <span className="text-[9px] text-green-400">{peer.peers.length + 1} ONLINE</span>
+            <span className="text-[9px] text-green-400">{testMode ? 1 : peer.peers.length + 1} ONLINE</span>
           </div>
           <div className="flex flex-wrap gap-1 mt-1">
             <span className="px-2 py-0.5 bg-green-950/50 border border-green-900/30 rounded text-[9px] text-green-400 tracking-wider">
               {myCallsign.toUpperCase()} (YOU)
             </span>
-            {peer.peers.map(p => (
+            {!testMode && peer.peers.map(p => (
               <span key={p.peerId} className="px-2 py-0.5 bg-blue-950/30 border border-blue-900/30 rounded text-[9px] text-blue-400 tracking-wider">
                 {p.callsign || 'UNIT'}
               </span>
@@ -504,7 +580,7 @@ export default function App() {
             onMouseLeave={handleReleasePTT}
             onTouchStart={(e) => { e.preventDefault(); handlePushToTalk(); }}
             onTouchEnd={(e) => { e.preventDefault(); handleReleasePTT(); }}
-            disabled={isReceiving || peer.status !== 'waiting-for-peers'}
+            disabled={isReceiving || (!testMode && peer.status !== 'waiting-for-peers')}
             className={`w-full py-5 rounded-xl font-bold text-lg tracking-wider transition-all duration-150 ${
               isTransmitting
                 ? 'bg-red-600 text-white shadow-[0_0_30px_rgba(239,68,68,0.5)] scale-95 border-2 border-red-400'
