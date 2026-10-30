@@ -7,10 +7,17 @@ export interface PeerInfo {
   connected: boolean;
 }
 
+export type ConnectionStatus = 
+  | 'idle'
+  | 'connecting'
+  | 'connected'
+  | 'waiting-for-peers'
+  | 'error';
+
 export interface UsePeerConnectionReturn {
   myPeerId: string | null;
   peers: PeerInfo[];
-  isConnected: boolean;
+  status: ConnectionStatus;
   isHost: boolean;
   createRoom: (callsign: string) => Promise<string>;
   joinRoom: (roomCode: string, callsign: string) => Promise<void>;
@@ -20,7 +27,18 @@ export interface UsePeerConnectionReturn {
   onIncomingAudio: (callback: (stream: MediaStream, callsign: string) => void) => void;
   onIncomingAudioEnd: (callback: (callsign: string) => void) => void;
   error: string | null;
+  debugLog: string[];
 }
+
+// Multiple ICE servers for better connectivity across networks
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun3.l.google.com:19302' },
+  { urls: 'stun:stun4.l.google.com:19302' },
+  { urls: 'stun:global.stun.twilio.com:3478' },
+];
 
 export function usePeerConnection(): UsePeerConnectionReturn {
   const peerRef = useRef<Peer | null>(null);
@@ -29,14 +47,21 @@ export function usePeerConnection(): UsePeerConnectionReturn {
   const myStreamRef = useRef<MediaStream | null>(null);
   const [myPeerId, setMyPeerId] = useState<string | null>(null);
   const [peers, setPeers] = useState<PeerInfo[]>([]);
-  const [isConnected, setIsConnected] = useState(false);
+  const [status, setStatus] = useState<ConnectionStatus>('idle');
   const [isHost, setIsHost] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [debugLog, setDebugLog] = useState<string[]>([]);
   const incomingAudioCallbackRef = useRef<((stream: MediaStream, callsign: string) => void) | null>(null);
   const incomingAudioEndCallbackRef = useRef<((callsign: string) => void) | null>(null);
   const callsignRef = useRef<string>('');
   const peerCallsignsRef = useRef<Map<string, string>>(new Map());
   const isHostRef = useRef(false);
+
+  const log = useCallback((msg: string) => {
+    const timestamp = new Date().toLocaleTimeString();
+    setDebugLog(prev => [...prev.slice(-19), `[${timestamp}] ${msg}`]);
+    console.log(`[ArmyRadio] ${msg}`);
+  }, []);
 
   const generateRoomCode = () => {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -58,10 +83,10 @@ export function usePeerConnection(): UsePeerConnectionReturn {
       try {
         conn.send({ type: 'peer-list', peers: peerList });
       } catch (e) {
-        console.error('Failed to broadcast peer list:', e);
+        log(`Failed to broadcast peer list: ${e}`);
       }
     });
-  }, []);
+  }, [log]);
 
   const updatePeersState = useCallback(() => {
     const peerList: PeerInfo[] = [];
@@ -73,11 +98,9 @@ export function usePeerConnection(): UsePeerConnectionReturn {
 
   const setupDataConnection = useCallback((conn: DataConnection) => {
     conn.on('open', () => {
-      console.log('Data connection opened with:', conn.peer);
-      // Send our callsign
+      log(`Data connection opened with: ${conn.peer}`);
       conn.send({ type: 'callsign', callsign: callsignRef.current });
       
-      // If we're host, broadcast updated peer list
       if (isHostRef.current) {
         setTimeout(() => broadcastPeerList(), 500);
       }
@@ -86,14 +109,15 @@ export function usePeerConnection(): UsePeerConnectionReturn {
     conn.on('data', (data: any) => {
       if (data.type === 'callsign') {
         peerCallsignsRef.current.set(conn.peer, data.callsign);
+        log(`Peer identified as: ${data.callsign}`);
         updatePeersState();
       } else if (data.type === 'transmission-end') {
         if (incomingAudioEndCallbackRef.current) {
           incomingAudioEndCallbackRef.current(data.callsign);
         }
       } else if (data.type === 'peer-list' && !isHostRef.current) {
-        // We received a peer list from the host - connect to all peers we're not connected to
         if (data.peers && Array.isArray(data.peers)) {
+          log(`Received peer list with ${data.peers.length} peers`);
           data.peers.forEach((p: { peerId: string; callsign: string }) => {
             if (p.peerId !== peerRef.current?.id && !dataConnectionsRef.current.has(p.peerId)) {
               connectToPeerDirect(p.peerId);
@@ -109,88 +133,99 @@ export function usePeerConnection(): UsePeerConnectionReturn {
       dataConnectionsRef.current.delete(conn.peer);
       mediaConnectionsRef.current.delete(conn.peer);
       updatePeersState();
-      console.log(`Peer disconnected: ${callsign}`);
+      log(`Peer disconnected: ${callsign}`);
       
-      // If host, rebroadcast updated list
       if (isHostRef.current) {
         setTimeout(() => broadcastPeerList(), 1000);
       }
     });
 
     conn.on('error', (err) => {
-      console.error('Data connection error:', conn.peer, err);
+      log(`Data connection error: ${err}`);
     });
-  }, [broadcastPeerList, updatePeersState]);
+  }, [broadcastPeerList, updatePeersState, log]);
 
   const connectToPeerDirect = useCallback((peerId: string) => {
     const peer = peerRef.current;
     if (!peer || peer.id === peerId) return;
     if (dataConnectionsRef.current.has(peerId)) return;
 
+    log(`Connecting to peer: ${peerId}`);
     const dataConn = peer.connect(peerId, { reliable: true, serialization: 'json' });
     dataConnectionsRef.current.set(peerId, dataConn);
     setupDataConnection(dataConn);
-  }, [setupDataConnection]);
+  }, [setupDataConnection, log]);
 
   const setupPeerEvents = useCallback((peer: Peer) => {
     peer.on('open', (id) => {
+      log(`Peer opened with ID: ${id}`);
       setMyPeerId(id);
-      setIsConnected(true);
+      setStatus('connected');
       setError(null);
     });
 
     peer.on('error', (err) => {
-      console.error('Peer error:', err);
+      log(`Peer error: ${err.type} - ${err.message}`);
       if (err.type === 'unavailable-id') {
-        setError('Room code already in use.');
+        setError('Room code already in use. Try again.');
       } else if (err.type === 'peer-unavailable') {
-        setError('Room not found. Check the code.');
+        setError('Room not found. Check the code and try again.');
       } else if (err.type === 'network' || err.type === 'server-error') {
-        setError('Network error. Check your connection.');
+        setError('Network error. Check your internet connection.');
+      } else if (err.type === 'disconnected') {
+        setError('Disconnected from server. Trying to reconnect...');
+      } else if (err.type === 'browser-incompatible') {
+        setError('Your browser does not support WebRTC. Try Chrome.');
       } else {
-        setError(`Error: ${err.type}`);
+        setError(`Error: ${err.type}. ${err.message || ''}`);
       }
+      setStatus('error');
     });
 
     peer.on('disconnected', () => {
-      console.log('Peer disconnected from signaling server, reconnecting...');
+      log('Disconnected from signaling server, reconnecting...');
+      setStatus('connecting');
       setTimeout(() => {
         if (peerRef.current && !peerRef.current.destroyed) {
-          try { peerRef.current.reconnect(); } catch(e) {}
+          try { 
+            peerRef.current.reconnect(); 
+            log('Reconnect attempt initiated');
+          } catch(e) {
+            log(`Reconnect failed: ${e}`);
+          }
         }
       }, 2000);
     });
 
-    // Handle incoming calls (audio streams from other peers)
     peer.on('call', (call) => {
       const callerCallsign = peerCallsignsRef.current.get(call.peer) || 'Unknown';
+      log(`Incoming call from: ${callerCallsign}`);
       
-      // Answer the call (we receive audio)
       call.answer();
       
       call.on('stream', (remoteStream) => {
-        console.log('Receiving audio from:', callerCallsign);
+        log(`Receiving audio stream from: ${callerCallsign}`);
         if (incomingAudioCallbackRef.current) {
           incomingAudioCallbackRef.current(remoteStream, callerCallsign);
         }
       });
 
       call.on('close', () => {
-        console.log('Call closed from:', callerCallsign);
+        log(`Call closed from: ${callerCallsign}`);
         mediaConnectionsRef.current.delete(call.peer);
       });
 
       call.on('error', (err) => {
-        console.error('Incoming call error:', err);
+        log(`Incoming call error: ${err}`);
       });
     });
 
-    // Handle incoming data connections
     peer.on('connection', (conn) => {
+      log(`Incoming connection from: ${conn.peer}`);
       dataConnectionsRef.current.set(conn.peer, conn);
       setupDataConnection(conn);
     });
-  }, [setupDataConnection]);
+  }, [setupDataConnection, log]);
 
   const createRoom = useCallback(async (callsign: string): Promise<string> => {
     return new Promise((resolve, reject) => {
@@ -198,62 +233,77 @@ export function usePeerConnection(): UsePeerConnectionReturn {
       callsignRef.current = callsign;
       setIsHost(true);
       isHostRef.current = true;
+      setStatus('connecting');
+      log(`Creating room with code: ${roomCode}`);
 
       const peer = new Peer(`army-radio-${roomCode}`, {
-        debug: 0,
+        debug: 1,
+        config: {
+          iceServers: ICE_SERVERS,
+        },
       });
 
       peerRef.current = peer;
       setupPeerEvents(peer);
 
       const timeout = setTimeout(() => {
+        setStatus('error');
+        setError('Connection timeout. The signaling server may be down.');
         reject(new Error('Connection timeout'));
-      }, 15000);
+      }, 20000);
 
       peer.on('open', () => {
         clearTimeout(timeout);
         setMyPeerId(peer.id);
-        setIsConnected(true);
+        setStatus('waiting-for-peers');
+        log(`Room created successfully: ${roomCode}`);
         resolve(roomCode);
       });
 
       peer.on('error', (err) => {
         clearTimeout(timeout);
         if (err.type === 'unavailable-id') {
+          log('Room code taken, retrying...');
           peer.destroy();
-          // Retry with new code
           createRoom(callsign).then(resolve).catch(reject);
         } else {
-          setError(err.message);
           reject(err);
         }
       });
     });
-  }, [setupPeerEvents]);
+  }, [setupPeerEvents, log]);
 
   const joinRoom = useCallback(async (roomCode: string, callsign: string): Promise<void> => {
     return new Promise((resolve, reject) => {
       callsignRef.current = callsign;
       setIsHost(false);
       isHostRef.current = false;
+      setStatus('connecting');
+      log(`Joining room: ${roomCode}`);
 
       const peer = new Peer(undefined as any, {
-        debug: 0,
+        debug: 1,
+        config: {
+          iceServers: ICE_SERVERS,
+        },
       });
 
       peerRef.current = peer;
       setupPeerEvents(peer);
 
       const timeout = setTimeout(() => {
-        reject(new Error('Connection timed out. Room may not exist.'));
-      }, 12000);
+        setStatus('error');
+        setError('Connection timed out. Room may not exist or server is unreachable.');
+        reject(new Error('Connection timed out'));
+      }, 15000);
 
       peer.on('open', () => {
         setMyPeerId(peer.id);
-        setIsConnected(true);
+        log(`Connected to signaling server as: ${peer.id}`);
 
-        // Connect to the host
         const hostId = `army-radio-${roomCode.toUpperCase()}`;
+        log(`Connecting to host: ${hostId}`);
+        
         const dataConn = peer.connect(hostId, { reliable: true, serialization: 'json' });
         dataConnectionsRef.current.set(hostId, dataConn);
         
@@ -261,15 +311,18 @@ export function usePeerConnection(): UsePeerConnectionReturn {
 
         dataConn.on('open', () => {
           clearTimeout(timeout);
-          // Add host to peers list
           peerCallsignsRef.current.set(hostId, 'HOST');
           updatePeersState();
+          setStatus('waiting-for-peers');
+          log(`Successfully joined room: ${roomCode}`);
           resolve();
         });
 
         dataConn.on('error', (err) => {
           clearTimeout(timeout);
-          setError('Could not connect to room.');
+          log(`Failed to connect to host: ${err}`);
+          setStatus('error');
+          setError('Could not connect to room host. Room may not exist.');
           reject(err);
         });
       });
@@ -277,61 +330,66 @@ export function usePeerConnection(): UsePeerConnectionReturn {
       peer.on('error', (err) => {
         clearTimeout(timeout);
         if (err.type === 'peer-unavailable') {
-          setError('Room not found. Check the code.');
+          setStatus('error');
+          setError('Room not found. Check the code and make sure the host is online.');
         } else {
+          setStatus('error');
           setError(`Connection error: ${err.type}`);
         }
         reject(err);
       });
     });
-  }, [setupPeerEvents, setupDataConnection, updatePeersState]);
+  }, [setupPeerEvents, setupDataConnection, updatePeersState, log]);
 
   const sendAudioStream = useCallback((stream: MediaStream) => {
     myStreamRef.current = stream;
     const peer = peerRef.current;
-    if (!peer) return;
+    if (!peer) {
+      log('Cannot send audio: no peer');
+      return;
+    }
 
-    // Call all connected peers with our audio stream
+    log(`Sending audio to ${dataConnectionsRef.current.size} peers`);
+
     dataConnectionsRef.current.forEach((_, peerId) => {
       try {
-        // Close existing media connection if any
         const existing = mediaConnectionsRef.current.get(peerId);
         if (existing) {
-          existing.close();
+          try { existing.close(); } catch(e) {}
         }
         
         const mediaConn = peer.call(peerId, stream);
         mediaConnectionsRef.current.set(peerId, mediaConn);
+        log(`Calling peer: ${peerId}`);
         
         mediaConn.on('error', (err) => {
-          console.error('Media call error to', peerId, err);
+          log(`Media call error to ${peerId}: ${err}`);
         });
       } catch (e) {
-        console.error('Failed to call peer:', peerId, e);
+        log(`Failed to call peer ${peerId}: ${e}`);
       }
     });
-  }, []);
+  }, [log]);
 
   const stopAudioStream = useCallback(() => {
-    // Stop microphone tracks
+    log('Stopping audio stream');
+    
     if (myStreamRef.current) {
       myStreamRef.current.getTracks().forEach(track => track.stop());
       myStreamRef.current = null;
     }
 
-    // Close all media connections and notify peers
     mediaConnectionsRef.current.forEach((conn) => {
       try { conn.close(); } catch(e) {}
     });
     mediaConnectionsRef.current.clear();
 
-    // Send transmission-end signal via data connections
     dataConnectionsRef.current.forEach((conn) => {
       try {
         conn.send({ type: 'transmission-end', callsign: callsignRef.current });
       } catch(e) {}
     });
-  }, []);
+  }, [log]);
 
   const onIncomingAudio = useCallback((callback: (stream: MediaStream, callsign: string) => void) => {
     incomingAudioCallbackRef.current = callback;
@@ -342,25 +400,23 @@ export function usePeerConnection(): UsePeerConnectionReturn {
   }, []);
 
   const leaveRoom = useCallback(() => {
-    // Stop all streams
+    log('Leaving room');
+    
     if (myStreamRef.current) {
       myStreamRef.current.getTracks().forEach(track => track.stop());
       myStreamRef.current = null;
     }
 
-    // Close all media connections
     mediaConnectionsRef.current.forEach((conn) => {
       try { conn.close(); } catch(e) {}
     });
     mediaConnectionsRef.current.clear();
 
-    // Close all data connections
     dataConnectionsRef.current.forEach((conn) => {
       try { conn.close(); } catch(e) {}
     });
     dataConnectionsRef.current.clear();
 
-    // Destroy peer
     if (peerRef.current) {
       try { peerRef.current.destroy(); } catch(e) {}
       peerRef.current = null;
@@ -368,12 +424,12 @@ export function usePeerConnection(): UsePeerConnectionReturn {
 
     setPeers([]);
     setMyPeerId(null);
-    setIsConnected(false);
+    setStatus('idle');
     setIsHost(false);
     isHostRef.current = false;
     peerCallsignsRef.current.clear();
     setError(null);
-  }, []);
+  }, [log]);
 
   useEffect(() => {
     return () => {
@@ -389,7 +445,7 @@ export function usePeerConnection(): UsePeerConnectionReturn {
   return {
     myPeerId,
     peers,
-    isConnected,
+    status,
     isHost,
     createRoom,
     joinRoom,
@@ -399,5 +455,6 @@ export function usePeerConnection(): UsePeerConnectionReturn {
     onIncomingAudio,
     onIncomingAudioEnd,
     error,
+    debugLog,
   };
 }
